@@ -1,5 +1,5 @@
 import config, { validateConfig } from './config/index.js';
-import { initClient, getUsdcBalance, getClient } from './services/client.js';
+import { initClient, getUsdcBalance, getClient, getMidpointSafe } from './services/client.js';
 import { executeBuy, executeSell } from './services/executor.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
 import { getOpenPositions } from './services/position.js';
@@ -67,12 +67,11 @@ async function buildStatusContent() {
         for (let i = 0; i < positions.length; i++) {
             const pos = positions[i];
 
-            // Fetch current midpoint price (best-effort)
+            // Fetch current midpoint price (best-effort; no log on missing orderbook)
             let currentPrice = null;
             try {
-                const client = getClient();
-                const mp = await client.getMidpoint(pos.tokenId);
-                currentPrice = parseFloat(mp?.mid ?? mp ?? '0');
+                const mp = await getMidpointSafe(pos.tokenId);
+                currentPrice = mp ? parseFloat(mp.mid) : null;
                 if (!currentPrice || isNaN(currentPrice)) currentPrice = null;
             } catch { /* price unavailable */ }
 

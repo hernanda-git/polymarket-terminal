@@ -12,7 +12,7 @@
 import { Side, OrderType } from '@polymarket/clob-client';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
+import { getClient, getUsdcBalance, getPolygonProvider, getMidpointSafe } from './client.js';
 import { splitPosition, mergePositions } from './ctf.js';
 import logger from '../utils/logger.js';
 
@@ -80,14 +80,9 @@ async function cancelOrder(orderId) {
 
 async function marketSell(tokenId, shares, tickSize, negRisk) {
     if (config.dryRun) {
-        try {
-            const client = getClient();
-            const mp = await client.getMidpoint(tokenId);
-            const price = parseFloat(mp?.mid ?? mp ?? '0') || 0;
-            return { success: true, fillPrice: price };
-        } catch {
-            return { success: true, fillPrice: 0 };
-        }
+        const mp = await getMidpointSafe(tokenId);
+        const price = mp ? parseFloat(mp.mid) || 0 : 0;
+        return { success: true, fillPrice: price };
     }
 
     const client = getClient();
@@ -123,14 +118,10 @@ async function isOrderFilled(orderId, shares) {
 
 // For simulation: check if market price has reached the sell target
 async function simPriceHitTarget(tokenId) {
-    try {
-        const client = getClient();
-        const mp = await client.getMidpoint(tokenId);
-        const price = parseFloat(mp?.mid ?? mp ?? '0');
-        return price >= config.mmSellPrice ? price : null;
-    } catch {
-        return null;
-    }
+    const mp = await getMidpointSafe(tokenId);
+    if (!mp) return null;
+    const price = parseFloat(mp.mid);
+    return price >= config.mmSellPrice ? price : null;
 }
 
 // ── Core monitoring loop ──────────────────────────────────────────────────────
@@ -305,11 +296,9 @@ async function attemptRecoveryBuy(pos) {
 
     for (let i = 0; i < 10; i++) {
         for (const [key, tokenId] of [['yes', pos.yes.tokenId], ['no', pos.no.tokenId]]) {
-            try {
-                const mp    = await client.getMidpoint(tokenId);
-                const price = parseFloat(mp?.mid ?? mp ?? '0') || 0;
-                samples[key].push(price);
-            } catch { /* skip */ }
+            const mp = await getMidpointSafe(tokenId);
+            const price = mp ? parseFloat(mp.mid) || 0 : 0;
+            samples[key].push(price);
         }
         if (i < 9) await sleep(1000);
     }
@@ -385,10 +374,8 @@ async function attemptRecoveryBuy(pos) {
 
     // Check current price
     let currentPrice = entryPrice;
-    try {
-        const mp   = await client.getMidpoint(candidate.tokenId);
-        currentPrice = parseFloat(mp?.mid ?? mp ?? String(entryPrice)) || entryPrice;
-    } catch { /* use entryPrice as fallback */ }
+    const mp = await getMidpointSafe(candidate.tokenId);
+    if (mp && Number.isFinite(mp.mid)) currentPrice = parseFloat(mp.mid);
 
     if (currentPrice >= entryPrice) {
         logger.success(`MM recovery: price holding $${currentPrice.toFixed(3)} ≥ entry $${entryPrice.toFixed(3)} — keeping position`);

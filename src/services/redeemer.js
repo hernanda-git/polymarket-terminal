@@ -1,9 +1,20 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getPolygonProvider } from './client.js';
+import { getPolygonProvider, getUsdcBalance } from './client.js';
 import { getOpenPositions, removePosition } from './position.js';
 import { recordSimResult } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.join(__dirname, '..', '..', 'data');
+const POSITION_LOG_FILE = path.join(DATA_DIR, 'position_log.txt');
+
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 // Contract addresses on Polygon
 const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
@@ -99,7 +110,50 @@ async function redeemPosition(conditionId, isNegRisk = false) {
 }
 
 /**
- * Simulate redemption: determine win/loss and record stats
+ * Append a human-readable snapshot of current balance, open positions, and
+ * the most recent resolution (win/loss + PnL) to a text log file.
+ */
+async function appendPositionLog({ position, result, pnl, returned }) {
+    try {
+        const balance = await getUsdcBalance();
+        const openPositions = getOpenPositions();
+        const ts = new Date().toISOString();
+
+        const lines = [];
+        lines.push(`=== Snapshot ${ts} ===`);
+        lines.push(`Balance: $${balance.toFixed(2)}`);
+        lines.push('');
+        lines.push('Open positions:');
+
+        if (openPositions.length === 0) {
+            lines.push('  (none)');
+        } else {
+            for (const p of openPositions) {
+                lines.push(
+                    `  - ${p.market} | ${p.outcome || '?'} | ` +
+                    `${p.shares.toFixed(3)} sh @ $${p.avgBuyPrice.toFixed(3)} | cost $${p.totalCost.toFixed(2)}`,
+                );
+            }
+        }
+
+        lines.push('');
+        lines.push('Last resolution:');
+        const sign = pnl >= 0 ? '+' : '';
+        lines.push(`  Market : ${position.market}`);
+        lines.push(`  Outcome: ${position.outcome}`);
+        lines.push(`  Result : ${result}`);
+        lines.push(`  Returned: $${returned.toFixed(2)}`);
+        lines.push(`  PnL    : ${sign}$${pnl.toFixed(2)}`);
+        lines.push('');
+
+        fs.appendFileSync(POSITION_LOG_FILE, `${lines.join('\n')}\n`, 'utf-8');
+    } catch (err) {
+        logger.error('Failed to write position log:', err.message);
+    }
+}
+
+/**
+ * Simulate redemption: determine win/loss and record stats + text log
  */
 async function simulateRedeem(position) {
     // Need on-chain payout to know who actually won
@@ -132,6 +186,14 @@ async function simulateRedeem(position) {
         );
         recordSimResult(position, 'LOSS', pnl, returned);
     }
+
+    // Write a snapshot of current balance, open positions, and this resolution
+    await appendPositionLog({
+        position,
+        result: payoutFraction > 0 ? 'WIN' : 'LOSS',
+        pnl,
+        returned,
+    });
 
     removePosition(position.conditionId);
     return true;

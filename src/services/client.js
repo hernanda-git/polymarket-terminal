@@ -3,6 +3,27 @@ import { Wallet } from 'ethers';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 
+/**
+ * Get midpoint price for a token without using the CLOB client's request path.
+ * Returns null if the orderbook doesn't exist (404 / resolved or expired market),
+ * so we avoid the "[CLOB Client] request error" log for missing orderbooks.
+ * @param {string} tokenId - CLOB token id
+ * @returns {Promise<{ mid: number } | null>}
+ */
+export async function getMidpointSafe(tokenId) {
+    const url = `${config.clobHost}/midpoint?token_id=${encodeURIComponent(String(tokenId))}`;
+    try {
+        const res = await fetch(url);
+        if (res.status === 404) return null;
+        const data = await res.json();
+        if (data?.error && String(data.error).toLowerCase().includes('orderbook')) return null;
+        const mid = parseFloat(data?.mid ?? data);
+        return Number.isFinite(mid) ? { mid } : null;
+    } catch {
+        return null;
+    }
+}
+
 let clobClient = null;
 let signer = null;
 

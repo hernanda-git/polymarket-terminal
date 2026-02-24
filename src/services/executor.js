@@ -7,24 +7,13 @@ import { placeAutoSell } from './autoSell.js';
 import { recordSimBuy } from '../utils/simStats.js';
 import logger from '../utils/logger.js';
 
-/**
- * Calculate trade size for our entry — independent of the individual fill event.
- *
- * Limit orders can be filled in many small chunks; using the event's fill size
- * would give inconsistent (often sub-minimum) results.
- *
- * SIZE_MODE=percentage → SIZE_PERCENT% of MAX_POSITION_SIZE per market
- * SIZE_MODE=balance    → SIZE_PERCENT% of our current USDC.e balance
- */
-async function calculateTradeSize() {
-    if (config.sizeMode === 'percentage') {
-        return config.maxPositionSize * (config.sizePercent / 100);
-    } else if (config.sizeMode === 'balance') {
-        const balance = await getUsdcBalance();
-        return balance * (config.sizePercent / 100);
-    }
-    return 0;
-}
+// Once the first BUY trade is successfully executed, we lock onto that
+// market/condition and ignore all other markets (both buys and sells).
+let mainConditionId = null;
+
+// Timestamp of last successful BUY (dry or live). Used to skip buys if we already bought within 1 minute.
+const BUY_COOLDOWN_MS = 60_000; // 1 minute
+let lastBuyTimestamp = 0;
 
 /**
  * Get market options (tick size and neg risk) for a token
@@ -68,6 +57,20 @@ export async function executeBuy(trade) {
     const marketOpts = await getMarketOptions(tokenId);
     const effectiveConditionId = conditionId || marketOpts.conditionId;
 
+    // If we've already locked onto a main topic, ignore buys from all other markets.
+    if (mainConditionId && effectiveConditionId && effectiveConditionId !== mainConditionId) {
+        return;
+    }
+
+    // At most 1 buy per minute — skip if we already bought within the last minute.
+    const now = Date.now();
+    if (lastBuyTimestamp > 0 && now - lastBuyTimestamp < BUY_COOLDOWN_MS) {
+        logger.info(
+            `Skipping buy: already had 1 buy in the last minute (${Math.round((BUY_COOLDOWN_MS - (now - lastBuyTimestamp)) / 1000)}s cooldown left).`,
+        );
+        return;
+    }
+
     // Check existing position and max position size cap
     const existingPos = getPosition(effectiveConditionId);
     if (existingPos) {
@@ -79,28 +82,34 @@ export async function executeBuy(trade) {
         logger.info(`Adding to existing position (spent $${spent.toFixed(2)} / $${config.maxPositionSize})`);
     }
 
-    // Calculate our trade size (independent of individual fill event)
-    let tradeSize = await calculateTradeSize();
+    // Remaining capacity for this market based on maxPositionSize
+    const remainingCap = existingPos
+        ? Math.max(config.maxPositionSize - (existingPos.totalCost || 0), 0)
+        : config.maxPositionSize;
 
-    // Cap so we don't exceed maxPositionSize
-    if (existingPos) {
-        const remaining = config.maxPositionSize - (existingPos.totalCost || 0);
-        tradeSize = Math.min(tradeSize, remaining);
-    } else {
-        tradeSize = Math.min(tradeSize, config.maxPositionSize);
-    }
-
-    if (tradeSize < config.minTradeSize) {
-        logger.warn(`Trade size $${tradeSize.toFixed(2)} below minimum $${config.minTradeSize}. Skipping.`);
+    if (remainingCap <= 0) {
+        logger.warn(`No remaining capacity for: ${market || effectiveConditionId}. Skipping.`);
         return;
     }
 
-    // Check balance
+    // We want each trade to be exactly MIN_TRADE_SIZE (e.g. $1) — never more,
+    // never less. If we don't have that much remaining capacity, we skip.
+    const tradeUnit = config.minTradeSize;
+    if (remainingCap < tradeUnit) {
+        logger.info(
+            `Remaining capacity $${remainingCap.toFixed(2)} below trade unit $${tradeUnit} for ${market || effectiveConditionId}. Skipping further buys.`,
+        );
+        return;
+    }
+
+    // Check balance before deciding on the trade
     const balance = await getUsdcBalance();
-    if (balance < tradeSize) {
-        logger.error(`Insufficient balance: $${balance.toFixed(2)} < $${tradeSize.toFixed(2)} needed`);
+    if (balance < tradeUnit) {
+        logger.error(`Insufficient balance: $${balance.toFixed(2)} < trade unit $${tradeUnit.toFixed(2)} needed`);
         return;
     }
+
+    const tradeSize = tradeUnit;
 
     logger.trade(`BUY ${market || tokenId} | Size: $${tradeSize.toFixed(2)} | Trader price: ${price}`);
 
@@ -128,6 +137,14 @@ export async function executeBuy(trade) {
             });
         }
         recordSimBuy();
+        lastBuyTimestamp = Date.now();
+
+        // Lock onto this topic after the first successful simulated buy
+        if (!mainConditionId && effectiveConditionId) {
+            mainConditionId = effectiveConditionId;
+            logger.info(`Main topic locked to condition ${effectiveConditionId} (${market || marketOpts.question || tokenId})`);
+        }
+
         return;
     }
 
@@ -226,6 +243,14 @@ export async function executeBuy(trade) {
             await placeAutoSell(effectiveConditionId, tokenId, totalSharesFilled, fillAvgPrice, marketOpts);
         }
     }
+
+    lastBuyTimestamp = Date.now();
+
+    // Lock onto this topic after the first successful live buy
+    if (!mainConditionId && effectiveConditionId) {
+        mainConditionId = effectiveConditionId;
+        logger.info(`Main topic locked to condition ${effectiveConditionId} (${market || marketOpts.question || tokenId})`);
+    }
 }
 
 /**
@@ -241,6 +266,11 @@ export async function executeSell(trade) {
     if (!effectiveConditionId) {
         marketOpts = await getMarketOptions(tokenId);
         effectiveConditionId = marketOpts.conditionId;
+    }
+
+    // If we've locked onto a main topic, ignore sells from all other markets.
+    if (mainConditionId && effectiveConditionId && effectiveConditionId !== mainConditionId) {
+        return;
     }
 
     // Check if we have a position
