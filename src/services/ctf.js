@@ -20,7 +20,6 @@ export const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 export const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e
 export const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 export const NEG_RISK_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
-export const MULTISEND_ADDRESS = '0x40A2aCCbd92BCA938b02010E17A5b8929b49130D'; // Gnosis Safe MultiSend (Polygon)
 
 // ── ABIs (minimal) ────────────────────────────────────────────────────────────
 
@@ -107,15 +106,15 @@ let _txQueue = Promise.resolve();
  * Calls are serialized via an internal queue so nonces never collide.
  * Retries up to MAX_RETRIES times on transient errors.
  */
-export function execSafeCall(to, data, description = '', operation = 0) {
+export function execSafeCall(to, data, description = '') {
     // Enqueue: this call will only start after the previous one resolves/rejects
-    const result = _txQueue.then(() => _doExecSafeCall(to, data, description, operation));
+    const result = _txQueue.then(() => _doExecSafeCall(to, data, description));
     // Don't let a failure poison the queue for subsequent calls
     _txQueue = result.catch(() => { });
     return result;
 }
 
-async function _doExecSafeCall(to, data, description = '', operation = 0) {
+async function _doExecSafeCall(to, data, description = '') {
     if (description) logger.info(`MM: exec safe tx — ${description}`);
 
     let lastErr;
@@ -154,37 +153,12 @@ async function _doExecSafeCall(to, data, description = '', operation = 0) {
             const gasTip = feeData.maxPriorityFeePerGas?.gt(MIN_TIP) ? feeData.maxPriorityFeePerGas : MIN_TIP;
             const gasFeeCap = feeData.maxFeePerGas ?? ethers.utils.parseUnits('500', 'gwei');
 
-            // Estimate gas with a timeout — serves as validation that the tx will succeed.
-            // If estimation reverts → tx would fail anyway, so we throw immediately.
-            // If estimation hangs (RPC timeout) → fallback to a safe limit.
-            const txArgs = [
-                to, 0, data, operation ?? 0, 0, 0, 0,
+            const tx = await safe.execTransaction(
+                to, 0, data, 0, 0, 0, 0,
                 ethers.constants.AddressZero,
                 ethers.constants.AddressZero,
                 signature,
-            ];
-
-            let gasLimit;
-            try {
-                const estimatePromise = safe.estimateGas.execTransaction(...txArgs);
-                const timeoutPromise = new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('gas estimation timeout')), 10_000)
-                );
-                const estimated = await Promise.race([estimatePromise, timeoutPromise]);
-                gasLimit = estimated.mul(120).div(100); // +20% buffer
-            } catch (estErr) {
-                if (estErr.message === 'gas estimation timeout') {
-                    logger.warn(`Gas estimation timed out — using fallback 500k gasLimit`);
-                    gasLimit = 500_000;
-                } else {
-                    // Gas estimation reverted → tx will fail, don't waste gas
-                    throw estErr;
-                }
-            }
-
-            const tx = await safe.execTransaction(
-                ...txArgs,
-                { maxPriorityFeePerGas: gasTip, maxFeePerGas: gasFeeCap, gasLimit },
+                { maxPriorityFeePerGas: gasTip, maxFeePerGas: gasFeeCap },
             );
 
             const receipt = await tx.wait();
@@ -538,22 +512,9 @@ export async function redeemMMPositions() {
 // ── Sniper-specific redeemer ──────────────────────────────────────────────────
 
 /**
- * Encode a single call for Gnosis Safe MultiSend.
- * Format: [operation:uint8][to:address][value:uint256][dataLength:uint256][data:bytes]
- */
-function encodeMultiSendCall(to, data) {
-    const operation = 0; // CALL
-    return ethers.utils.solidityPack(
-        ['uint8', 'address', 'uint256', 'uint256', 'bytes'],
-        [operation, to, 0, ethers.utils.hexDataLength(data), data],
-    );
-}
-
-/**
  * Redeem ONLY winning sniper positions via Gnosis Safe.
- * - Skips positions with $0 payout (losers)
- * - Batches multiple redemptions into a single MultiSend transaction
- * - Uses explicit gasLimit to prevent gas estimation hangs
+ * Same approach as redeemMMPositions but skips losers ($0 payout).
+ * Redeems one by one — simple and reliable.
  */
 export async function redeemSniperPositions() {
     // 1. Query Data API for all positions held by the proxy wallet
@@ -591,8 +552,7 @@ export async function redeemSniperPositions() {
         });
     }
 
-    // 2. Filter to only winning positions and collect redeemable conditionIds
-    const redeemBatch = []; // { conditionId, expectedUsdc, totalShares }
+    let redeemed = 0;
 
     for (const [conditionId, tokens] of byCondition) {
         try {
@@ -621,82 +581,37 @@ export async function redeemSniperPositions() {
                 (sum, shares, i) => sum + shares * (payoutFractions[i] ?? 0), 0
             );
 
+            const label = conditionId.slice(0, 12) + '...';
+
             // ── WIN-ONLY: skip if payout is ~$0 (loser) ──
             if (expectedUsdc < 0.01) {
-                logger.info(`SNIPER redeemer: skip ${conditionId.slice(0, 12)}... — $0 payout (loss)`);
+                logger.info(`SNIPER redeemer: skip ${label} — $0 payout (loss)`);
                 continue;
             }
 
-            redeemBatch.push({ conditionId, expectedUsdc, totalShares });
-        } catch (err) {
-            logger.error(`SNIPER redeemer: error checking ${conditionId.slice(0, 12)}... — ${parseOnchainError(err)}`);
-        }
-    }
+            if (config.dryRun) {
+                logger.money(`SNIPER[SIM] redeem: ${label} — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
+                continue;
+            }
 
-    if (redeemBatch.length === 0) return;
+            logger.info(`SNIPER redeemer: ${label} resolved — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC`);
 
-    // 3. Dry-run logging
-    if (config.dryRun) {
-        for (const { conditionId, expectedUsdc, totalShares } of redeemBatch) {
-            logger.money(`SNIPER[SIM] redeem: ${conditionId.slice(0, 12)}... — ${totalShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
-        }
-        return;
-    }
-
-    // 4. Build batch: if >1 position, use MultiSend; otherwise single call
-    if (redeemBatch.length === 1) {
-        // Single redeem — direct call
-        const { conditionId, expectedUsdc } = redeemBatch[0];
-        const label = conditionId.slice(0, 12) + '...';
-        const data = ctfIface.encodeFunctionData('redeemPositions', [
-            USDC_ADDRESS, ethers.constants.HashZero, conditionId, [1, 2],
-        ]);
-        try {
+            // Redeem through Safe — same as MM redeemer
+            const data = ctfIface.encodeFunctionData('redeemPositions', [
+                USDC_ADDRESS,
+                ethers.constants.HashZero,
+                conditionId,
+                [1, 2],
+            ]);
             await execSafeCall(CTF_ADDRESS, data, `SNIPER redeemPositions ${label}`);
             logger.money(`SNIPER redeemer: redeemed ${label} → ~$${expectedUsdc.toFixed(2)} USDC ✅`);
+            redeemed++;
         } catch (err) {
-            logger.error(`SNIPER redeemer: failed ${label} — ${parseOnchainError(err)}`);
+            logger.error(`SNIPER redeemer: failed to redeem ${conditionId.slice(0, 12)}... — ${parseOnchainError(err)}`);
         }
-    } else {
-        // Bulk redeem via Gnosis Safe MultiSend
-        logger.info(`SNIPER redeemer: batching ${redeemBatch.length} winning redemptions into MultiSend...`);
+    }
 
-        const encodedCalls = redeemBatch.map(({ conditionId }) => {
-            const callData = ctfIface.encodeFunctionData('redeemPositions', [
-                USDC_ADDRESS, ethers.constants.HashZero, conditionId, [1, 2],
-            ]);
-            return encodeMultiSendCall(CTF_ADDRESS, callData);
-        });
-
-        // MultiSend ABI: multiSend(bytes transactions)
-        const multiSendIface = new ethers.utils.Interface([
-            'function multiSend(bytes transactions)',
-        ]);
-        const packedCalls = ethers.utils.hexlify(ethers.utils.concat(encodedCalls));
-        const multiSendData = multiSendIface.encodeFunctionData('multiSend', [packedCalls]);
-
-        const totalExpected = redeemBatch.reduce((s, r) => s + r.expectedUsdc, 0);
-
-        try {
-            // operation = 1 (DELEGATECALL) for MultiSend
-            await execSafeCall(MULTISEND_ADDRESS, multiSendData, `SNIPER bulk redeem (${redeemBatch.length} positions)`, 1);
-            logger.money(`SNIPER redeemer: bulk redeemed ${redeemBatch.length} positions → ~$${totalExpected.toFixed(2)} USDC total ✅`);
-        } catch (err) {
-            logger.error(`SNIPER redeemer: bulk redeem failed — ${parseOnchainError(err)}`);
-            // Fallback: try one by one
-            logger.warn('SNIPER redeemer: falling back to individual redemptions...');
-            for (const { conditionId, expectedUsdc } of redeemBatch) {
-                const label = conditionId.slice(0, 12) + '...';
-                const data = ctfIface.encodeFunctionData('redeemPositions', [
-                    USDC_ADDRESS, ethers.constants.HashZero, conditionId, [1, 2],
-                ]);
-                try {
-                    await execSafeCall(CTF_ADDRESS, data, `SNIPER redeemPositions ${label}`);
-                    logger.money(`SNIPER redeemer: redeemed ${label} → ~$${expectedUsdc.toFixed(2)} USDC ✅`);
-                } catch (err2) {
-                    logger.error(`SNIPER redeemer: failed ${label} — ${parseOnchainError(err2)}`);
-                }
-            }
-        }
+    if (redeemed > 0) {
+        logger.success(`SNIPER redeemer: collected ${redeemed} winning position(s)`);
     }
 }
