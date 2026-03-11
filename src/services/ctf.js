@@ -545,12 +545,24 @@ const _skippedLosses = new Set();
 // Callback invoked when a win is detected — receives conditionId
 let _onWinCallback = null;
 
+// Function to look up conditionId → { asset, yesTokenId, noTokenId }
+// Injected from sniper entry point to avoid circular imports
+let _getConditionInfo = null;
+
 /**
  * Register a callback to be called when a sniper win is detected.
  * Callback signature: (conditionId: string) => void
  */
 export function onSniperWin(cb) {
     _onWinCallback = cb;
+}
+
+/**
+ * Register a function to look up sniper condition info (token mapping).
+ * Used to correctly map token balances to outcome indices.
+ */
+export function setSniperConditionLookup(fn) {
+    _getConditionInfo = fn;
 }
 
 /**
@@ -639,19 +651,36 @@ export async function redeemSniperPositions() {
             // Determine winning outcome index (the one with payoutFraction > 0)
             const winningOutcome = payoutFractions[0] > 0 ? 0 : payoutFractions[1] > 0 ? 1 : -1;
 
+            const label = conditionId.slice(0, 12) + '...';
+
+            // Map token balances to outcome indices using sniper's token mapping.
+            // yesTokenId = outcome 0 (clobTokenIds[0]), noTokenId = outcome 1
+            const sniperInfo = _getConditionInfo ? _getConditionInfo(conditionId) : null;
+
+            // Build outcome→balance mapping (keyed by outcome index, not array index)
+            const outcomeBalances = [0, 0];
+            if (sniperInfo) {
+                for (let i = 0; i < tokens.length; i++) {
+                    if (tokens[i].tokenId === sniperInfo.yesTokenId) outcomeBalances[0] = balances[i];
+                    else if (tokens[i].tokenId === sniperInfo.noTokenId) outcomeBalances[1] = balances[i];
+                }
+            } else {
+                // No sniper mapping — skip (not a sniper position)
+                continue;
+            }
+
             // Win = we hold shares on the winning outcome side
-            const isWin = winningOutcome >= 0 && balances[winningOutcome] > 0;
-            const expectedUsdc = balances.reduce(
+            const winShares = winningOutcome >= 0 ? outcomeBalances[winningOutcome] : 0;
+            const isWin = winShares > 0;
+            const expectedUsdc = outcomeBalances.reduce(
                 (sum, shares, i) => sum + shares * (payoutFractions[i] ?? 0), 0
             );
-
-            const label = conditionId.slice(0, 12) + '...';
 
             // SNIPER: only redeem WINNERS — cache losses to skip next time
             if (!isWin) {
                 _skippedLosses.add(conditionId);
                 if (config.dryRun) {
-                    logger.info(`SNIPER[SIM] skip loss: ${label} — ${totalShares.toFixed(3)} shares, outcome=${winningOutcome} (cached)`);
+                    logger.info(`SNIPER[SIM] skip loss: ${label} — outcome=${winningOutcome}, win_shares=0 (cached)`);
                 } else {
                     logger.info(`SNIPER redeemer: skip loss ${label} — outcome=${winningOutcome}, no shares on winner`);
                 }
@@ -662,11 +691,11 @@ export async function redeemSniperPositions() {
             if (_onWinCallback) _onWinCallback(conditionId);
 
             if (config.dryRun) {
-                logger.money(`SNIPER[SIM] redeem: ${label} — ${balances[winningOutcome].toFixed(3)} shares on outcome ${winningOutcome} → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
+                logger.money(`SNIPER[SIM] redeem: ${label} — ${winShares.toFixed(3)} shares on outcome ${winningOutcome} → ~$${expectedUsdc.toFixed(2)} USDC (WIN)`);
                 continue;
             }
 
-            logger.info(`SNIPER redeemer: ${label} resolved WIN — outcome ${winningOutcome}, ${balances[winningOutcome].toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC`);
+            logger.info(`SNIPER redeemer: ${label} resolved WIN — outcome ${winningOutcome}, ${winShares.toFixed(3)} shares → ~$${expectedUsdc.toFixed(2)} USDC`);
 
             // Call redeemPositions through Safe — winners only
             const data = ctfIface.encodeFunctionData('redeemPositions', [

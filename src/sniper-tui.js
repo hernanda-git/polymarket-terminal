@@ -17,8 +17,8 @@ import { initClient } from './services/client.js';
 import { getUsdcBalance } from './services/client.js';
 import { initDashboard, appendLog, updateStatus, isDashboardActive } from './ui/dashboard.js';
 import { startSniperDetector, stopSniperDetector } from './services/sniperDetector.js';
-import { executeSnipe, getActiveSnipes, getConditionAsset } from './services/sniperExecutor.js';
-import { redeemSniperPositions, onSniperWin } from './services/ctf.js';
+import { executeSnipe, getActiveSnipes, getConditionAsset, getConditionInfo } from './services/sniperExecutor.js';
+import { redeemSniperPositions, onSniperWin, setSniperConditionLookup } from './services/ctf.js';
 import { getSchedule, isAssetInSession, getNextSessionInfo } from './services/schedule.js';
 import { getTimeMultiplier } from './services/sniperSizing.js';
 
@@ -181,6 +181,7 @@ function tickPause(asset) {
 }
 
 onSniperWin(handleWin);
+setSniperConditionLookup(getConditionInfo);
 
 // ── Market handler ────────────────────────────────────────────────────────────
 

@@ -19,8 +19,8 @@ import config from './config/index.js';
 import logger from './utils/logger.js';
 import { initClient } from './services/client.js';
 import { startSniperDetector, stopSniperDetector } from './services/sniperDetector.js';
-import { executeSnipe, getConditionAsset } from './services/sniperExecutor.js';
-import { redeemSniperPositions, onSniperWin } from './services/ctf.js';
+import { executeSnipe, getConditionAsset, getConditionInfo } from './services/sniperExecutor.js';
+import { redeemSniperPositions, onSniperWin, setSniperConditionLookup } from './services/ctf.js';
 import { getSchedule, isAssetInSession, getNextSessionInfo } from './services/schedule.js';
 import { getTimeMultiplier } from './services/sniperSizing.js';
 
@@ -93,8 +93,9 @@ function tickPause(asset) {
     }
 }
 
-// Register win callback
+// Register win callback and token lookup for correct outcome mapping
 onSniperWin(handleWin);
+setSniperConditionLookup(getConditionInfo);
 
 // ── Log session schedule ──────────────────────────────────────────────────────
 

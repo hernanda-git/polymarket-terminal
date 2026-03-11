@@ -16,15 +16,20 @@ import { getTimeMultiplier } from './sniperSizing.js';
 // In-memory tracking of placed snipe orders
 const activeSnipes = [];
 
-// conditionId → asset mapping (for win detection → pause linkage)
-const conditionAssetMap = new Map();
+// conditionId → { asset, yesTokenId, noTokenId } mapping
+// yesTokenId = outcome 0 (clobTokenIds[0]), noTokenId = outcome 1 (clobTokenIds[1])
+const conditionInfoMap = new Map();
 
 export function getActiveSnipes() {
     return [...activeSnipes];
 }
 
 export function getConditionAsset(conditionId) {
-    return conditionAssetMap.get(conditionId) || null;
+    return conditionInfoMap.get(conditionId)?.asset || null;
+}
+
+export function getConditionInfo(conditionId) {
+    return conditionInfoMap.get(conditionId) || null;
 }
 
 /**
@@ -56,8 +61,13 @@ export async function executeSnipe(market) {
     const label = question.slice(0, 40);
     const sim   = config.dryRun ? '[SIM] ' : '';
 
-    // Track conditionId → asset for win detection
-    conditionAssetMap.set(conditionId, asset.toLowerCase());
+    // Track conditionId → { asset, token IDs } for win detection
+    // yesTokenId = outcome 0 (clobTokenIds[0]), noTokenId = outcome 1 (clobTokenIds[1])
+    conditionInfoMap.set(conditionId, {
+        asset: asset.toLowerCase(),
+        yesTokenId,
+        noTokenId,
+    });
 
     const sides = [
         { name: 'UP',   tokenId: yesTokenId },
