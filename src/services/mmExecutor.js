@@ -232,10 +232,13 @@ async function monitorAndManage(pos) {
         // ── Defensive pivot: neither filled after timeout (5m markets only) ──
         if (config.mmDefensiveEnabled && config.mmDuration === '5m'
             && !pos.yes.filled && !pos.no.filled && !pos._defensiveActive) {
-            const elapsed = (Date.now() - new Date(pos.enteredAt).getTime()) / 1000;
+            // Measure from market open time (endTime - duration), not bot entry time
+            const marketDurationMs = 5 * 60 * 1000;
+            const marketStartMs = new Date(pos.endTime).getTime() - marketDurationMs;
+            const elapsed = (Date.now() - marketStartMs) / 1000;
             if (elapsed >= config.mmDefensiveTimeout) {
                 pos._defensiveActive = true;
-                logger.warn(`MM: neither side filled after ${Math.round(elapsed)}s — entering defensive mode | ${label}`);
+                logger.warn(`MM: neither side filled after ${Math.round(elapsed)}s since market open — entering defensive mode | ${label}`);
                 await defensivePivot(pos);
                 break;
             }
