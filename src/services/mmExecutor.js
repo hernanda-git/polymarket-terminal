@@ -469,8 +469,7 @@ async function adaptiveLegCL(pos, unfilledKey) {
     const minAdaptivePrice = Math.max(0, config.mmAdaptiveMinCombined - filledLegPrice);
 
     // ── Tiered floors (5m markets): progressively lower floor over time ────
-    // breakevenFloor: filledLeg + unfilledLeg = $1.00 → zero net P&L
-    const breakevenFloor = Math.max(0, 1.00 - filledLegPrice);
+    // Start from minAdaptivePrice (MM_ADAPTIVE_MIN_COMBINED - filledPrice), then drop per phase
     const floorDrop      = config.mmDefensiveEnabled ? 0.10 : 0;
     const emergencyPrice = config.mmDefensiveWorstThreshold; // default 0.10
 
@@ -480,22 +479,22 @@ async function adaptiveLegCL(pos, unfilledKey) {
      * Get the current floor based on time remaining (5m markets only).
      * Other durations use the fixed mmAdaptiveMinCombined floor.
      *
-     * Phase 1 (> 180s left): breakevenFloor         (e.g. 0.40 for 60c fill)
-     * Phase 2 (90–180s):     breakevenFloor - 0.10   (e.g. 0.30)
-     * Phase 3 (30–90s):      breakevenFloor - 0.20   (e.g. 0.20)
+     * Phase 1 (> 180s left): minAdaptivePrice              (from MM_ADAPTIVE_MIN_COMBINED)
+     * Phase 2 (90–180s):     minAdaptivePrice - 0.10
+     * Phase 3 (30–90s):      minAdaptivePrice - 0.20
      * Phase 4 (< 30s):       market sell
      */
     function getTieredFloor(msLeft) {
         if (!is5m) return minAdaptivePrice; // non-5m: use fixed floor
-        if (msLeft > 180_000) return breakevenFloor;
-        if (msLeft > 90_000)  return Math.max(0.01, breakevenFloor - floorDrop);
-        if (msLeft > 30_000)  return Math.max(0.01, breakevenFloor - floorDrop * 2);
+        if (msLeft > 180_000) return minAdaptivePrice;
+        if (msLeft > 90_000)  return Math.max(0.01, minAdaptivePrice - floorDrop);
+        if (msLeft > 30_000)  return Math.max(0.01, minAdaptivePrice - floorDrop * 2);
         return 0; // phase 4: market sell
     }
 
     logger.warn(`MM: one leg filled — starting adaptive CL for ${unfilledKey.toUpperCase()} | ${label}`);
     if (is5m) {
-        logger.info(`MM adaptive CL: filled @ $${filledLegPrice.toFixed(3)} | breakeven floor: $${breakevenFloor.toFixed(3)} | tiered: $${breakevenFloor.toFixed(2)} → $${Math.max(0.01, breakevenFloor - floorDrop).toFixed(2)} → $${Math.max(0.01, breakevenFloor - floorDrop * 2).toFixed(2)}`);
+        logger.info(`MM adaptive CL: filled @ $${filledLegPrice.toFixed(3)} | floor (minCombined $${config.mmAdaptiveMinCombined.toFixed(2)}): $${minAdaptivePrice.toFixed(3)} | tiered: $${minAdaptivePrice.toFixed(2)} → $${Math.max(0.01, minAdaptivePrice - floorDrop).toFixed(2)} → $${Math.max(0.01, minAdaptivePrice - floorDrop * 2).toFixed(2)}`);
     } else {
         logger.info(`MM adaptive CL: filled leg @ $${filledLegPrice.toFixed(3)} | min floor for combined ≥ $${config.mmAdaptiveMinCombined.toFixed(2)}: $${minAdaptivePrice.toFixed(3)}`);
     }
