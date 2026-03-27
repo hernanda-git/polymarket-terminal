@@ -69,13 +69,51 @@ export async function proxyFetch(url, opts = {}) {
 }
 
 /**
- * Test that the proxy works by making a simple request to the CLOB API.
+ * Check the outbound IP address that Polymarket sees.
+ * Uses both direct and proxied requests so you can compare.
+ */
+async function checkOutboundIP() {
+    const IP_SERVICE = 'https://api.ipify.org?format=json';
+
+    // 1. Check VPS direct IP
+    try {
+        const directResp = await fetch(IP_SERVICE, { signal: AbortSignal.timeout(10000) });
+        if (directResp.ok) {
+            const data = await directResp.json();
+            logger.info(`VPS direct IP : ${data.ip}`);
+        }
+    } catch {
+        logger.warn('Could not detect VPS direct IP');
+    }
+
+    // 2. Check proxied IP (what Polymarket will see)
+    if (fetchDispatcher) {
+        try {
+            const proxyResp = await fetch(IP_SERVICE, {
+                dispatcher: fetchDispatcher,
+                signal: AbortSignal.timeout(10000),
+            });
+            if (proxyResp.ok) {
+                const data = await proxyResp.json();
+                logger.info(`Proxy IP      : ${data.ip} ← Polymarket sees this`);
+            }
+        } catch {
+            logger.warn('Could not detect proxy IP — proxy may not be working');
+        }
+    }
+}
+
+/**
+ * Test that the proxy works and is not geoblocked by Polymarket CLOB.
  * Call this at startup to fail fast if the proxy is misconfigured.
  */
 export async function testProxy() {
     if (!config.proxyUrl) return true; // no proxy = nothing to test
 
     logger.info(`Testing proxy connection → ${maskProxyUrl(config.proxyUrl)} ...`);
+
+    // Show both IPs so user can verify which IP Polymarket sees
+    await checkOutboundIP();
 
     try {
         if (!fetchDispatcher) {
@@ -87,6 +125,22 @@ export async function testProxy() {
             dispatcher: fetchDispatcher,
             signal: AbortSignal.timeout(15000),
         });
+
+        if (resp.status === 403) {
+            const body = await resp.text().catch(() => '');
+            const isGeoblock = body.includes('restricted') || body.includes('region') || body.includes('geoblock');
+            if (isGeoblock) {
+                logger.error('═══════════════════════════════════════════════════');
+                logger.error('GEOBLOCKED — Polymarket CLOB rejected your proxy IP!');
+                logger.error('Your proxy IP is in a restricted region.');
+                logger.error('Change PROXY_URL in .env to a proxy in an allowed region.');
+                logger.error('Allowed regions: https://docs.polymarket.com/developers/CLOB/geoblock');
+                logger.error('═══════════════════════════════════════════════════');
+            } else {
+                logger.error(`CLOB returned 403 Forbidden: ${body.substring(0, 200)}`);
+            }
+            return false;
+        }
 
         if (!resp.ok) {
             throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
