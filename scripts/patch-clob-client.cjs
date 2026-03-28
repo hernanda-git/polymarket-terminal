@@ -66,6 +66,11 @@ axios_1.default.interceptors.request.use(function(cfg) {
     }
     return cfg;
 });
+// Safe JSON.stringify that strips circular agent refs
+const _safeStringify = (obj) => JSON.stringify(obj, (key, val) => {
+    if (key === 'httpsAgent' || key === 'httpAgent' || key === 'agent') return undefined;
+    return val;
+});
 // ── End proxy patch ────────────────────────────────────────────────────────
 `;
 
@@ -94,6 +99,14 @@ if (!injected) {
     console.error(code.substring(0, 1000));
     process.exit(0);
 }
+
+// ── Patch errorHandling to avoid circular JSON serialization ────────────────
+// The CLOB client does JSON.stringify(err.response.config) which includes
+// httpsAgent with circular references. Replace with safe serializer.
+const jsonCount = (code.match(/JSON\.stringify\(/g) || []).length;
+code = code.replace(/JSON\.stringify\(/g, '_safeStringify(');
+const patchedCount = (code.match(/_safeStringify\(/g) || []).length;
+console.log(`[patch] Replaced ${jsonCount} JSON.stringify calls with safe serializer`);
 
 fs.writeFileSync(TARGET, code, 'utf8');
 console.log('[patch] @polymarket/clob-client patched with proxy support ✅');
