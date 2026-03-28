@@ -145,6 +145,41 @@ async function isOrderFilled(orderId, shares, tokenId = null) {
 }
 
 /**
+ * Check how many shares of an order have been partially filled.
+ * Returns { matched, remaining, total }.
+ */
+async function getPartialFillInfo(orderId, originalShares, tokenId = null) {
+    let matched = 0;
+    if (orderId && !orderId.startsWith('sim-')) {
+        try {
+            const client = getClient();
+            const order = await client.getOrder(orderId);
+            if (order) {
+                if (order.status === 'MATCHED') {
+                    matched = parseFloat(order.original_size || order.size || String(originalShares));
+                } else {
+                    matched = parseFloat(order.size_matched || '0');
+                }
+            }
+        } catch { /* ignore */ }
+    }
+
+    // Cross-check with on-chain balance for accuracy
+    if (tokenId) {
+        const balance = await getTokenBalance(tokenId);
+        if (balance !== null) {
+            const onChainMatched = originalShares - balance;
+            if (onChainMatched > matched) {
+                matched = Math.max(0, onChainMatched);
+            }
+            return { matched, remaining: balance, total: originalShares };
+        }
+    }
+
+    return { matched, remaining: originalShares - matched, total: originalShares };
+}
+
+/**
  * Get partial fill amount for an order (how many shares already matched).
  * Returns 0 on error.
  */
@@ -209,6 +244,34 @@ async function monitorAndManage(pos) {
                 pos.yes.filled = true;
                 const pnl = (pos.yes.fillPrice - pos.yes.entryPrice) * pos.yes.shares;
                 logger.money(`MM${config.dryRun ? '[SIM]' : ''}: YES filled @ $${pos.yes.fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+            } else if (!config.dryRun) {
+                // Check for partial fill — if order is partially matched, handle it
+                const info = await getPartialFillInfo(pos.yes.orderId, pos.yes.shares, pos.yes.tokenId);
+                if (info.matched > 0 && info.remaining > 0 && info.remaining < pos.yes.shares * 0.90) {
+                    // Significant partial fill detected — cancel old order and handle remaining
+                    logger.warn(`MM: YES partially filled — ${info.matched.toFixed(3)}/${info.total.toFixed(3)} matched, ${info.remaining.toFixed(3)} remaining`);
+                    await cancelOrder(pos.yes.orderId);
+                    pos.yes.orderId = null;
+                    pos.yes.shares  = info.remaining; // update to remaining shares
+                    pos.yes._partialRevenue = (pos.yes._partialRevenue || 0) + info.matched * config.mmSellPrice;
+
+                    if (info.remaining < CLOB_MIN_ORDER_SHARES) {
+                        // Too few shares to re-place limit — market sell remainder
+                        logger.warn(`MM: YES remaining ${info.remaining.toFixed(3)} < ${CLOB_MIN_ORDER_SHARES} min — market selling remainder`);
+                        const result = await marketSell(pos.yes.tokenId, info.remaining, pos.tickSize, pos.negRisk);
+                        pos.yes.fillPrice = config.mmSellPrice; // weighted avg approximation
+                        pos.yes.filled = true;
+                        const pnl = (pos.yes._partialRevenue + result.fillPrice * info.remaining) - pos.yes.entryPrice * info.total;
+                        logger.money(`MM: YES fully sold (partial+market) | P&L $${pnl.toFixed(2)}`);
+                    } else {
+                        // Re-place limit sell for remaining shares
+                        const res = await placeLimitSell(pos.yes.tokenId, info.remaining, config.mmSellPrice, pos.tickSize, pos.negRisk);
+                        if (res.success) {
+                            pos.yes.orderId = res.orderId;
+                            logger.info(`MM: YES re-placed limit sell for ${info.remaining.toFixed(3)} shares @ $${config.mmSellPrice}`);
+                        }
+                    }
+                }
             }
         }
 
@@ -226,6 +289,31 @@ async function monitorAndManage(pos) {
                 pos.no.filled = true;
                 const pnl = (pos.no.fillPrice - pos.no.entryPrice) * pos.no.shares;
                 logger.money(`MM${config.dryRun ? '[SIM]' : ''}: NO  filled @ $${pos.no.fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+            } else if (!config.dryRun) {
+                // Check for partial fill
+                const info = await getPartialFillInfo(pos.no.orderId, pos.no.shares, pos.no.tokenId);
+                if (info.matched > 0 && info.remaining > 0 && info.remaining < pos.no.shares * 0.90) {
+                    logger.warn(`MM: NO partially filled — ${info.matched.toFixed(3)}/${info.total.toFixed(3)} matched, ${info.remaining.toFixed(3)} remaining`);
+                    await cancelOrder(pos.no.orderId);
+                    pos.no.orderId = null;
+                    pos.no.shares  = info.remaining;
+                    pos.no._partialRevenue = (pos.no._partialRevenue || 0) + info.matched * config.mmSellPrice;
+
+                    if (info.remaining < CLOB_MIN_ORDER_SHARES) {
+                        logger.warn(`MM: NO remaining ${info.remaining.toFixed(3)} < ${CLOB_MIN_ORDER_SHARES} min — market selling remainder`);
+                        const result = await marketSell(pos.no.tokenId, info.remaining, pos.tickSize, pos.negRisk);
+                        pos.no.fillPrice = config.mmSellPrice;
+                        pos.no.filled = true;
+                        const pnl = (pos.no._partialRevenue + result.fillPrice * info.remaining) - pos.no.entryPrice * info.total;
+                        logger.money(`MM: NO fully sold (partial+market) | P&L $${pnl.toFixed(2)}`);
+                    } else {
+                        const res = await placeLimitSell(pos.no.tokenId, info.remaining, config.mmSellPrice, pos.tickSize, pos.negRisk);
+                        if (res.success) {
+                            pos.no.orderId = res.orderId;
+                            logger.info(`MM: NO re-placed limit sell for ${info.remaining.toFixed(3)} shares @ $${config.mmSellPrice}`);
+                        }
+                    }
+                }
             }
         }
 
@@ -253,11 +341,45 @@ async function monitorAndManage(pos) {
             const elapsed = (Date.now() - marketStartMs) / 1000;
             if (elapsed >= config.mmDefensiveTimeout) {
                 // Cancel both orders FIRST so they can't fill while we wait
-                logger.warn(`MM: neither side filled after ${Math.round(elapsed)}s since market open — cancelling orders & entering defensive mode | ${label}`);
+                logger.warn(`MM: neither side filled after ${Math.round(elapsed)}s since market open — cancelling orders | ${label}`);
                 await cancelOrder(pos.yes.orderId);
                 await cancelOrder(pos.no.orderId);
                 pos.yes.orderId = null;
                 pos.no.orderId = null;
+
+                // Re-check fills after cancellation — CLOB may have filled one side
+                // between our last check and the cancel (race condition)
+                await sleep(2000); // give CLOB API time to update
+                for (const key of ['yes', 'no']) {
+                    if (!pos[key].filled) {
+                        const balance = await getTokenBalance(pos[key].tokenId);
+                        if (balance !== null && balance < pos[key].shares * 0.05) {
+                            logger.warn(`MM: ${key.toUpperCase()} actually filled (on-chain balance ${balance.toFixed(3)} ≈ 0) — detected after cancel`);
+                            pos[key].filled = true;
+                            pos[key].fillPrice = config.mmSellPrice;
+                            const pnl = (pos[key].fillPrice - pos[key].entryPrice) * pos[key].shares;
+                            logger.money(`MM: ${key.toUpperCase()} filled @ $${pos[key].fillPrice.toFixed(3)} | P&L $${pnl.toFixed(2)}`);
+                        }
+                    }
+                }
+
+                // If one side is now filled, go to adaptive CL instead of defensive pivot
+                if (pos.yes.filled !== pos.no.filled) {
+                    const unfilledKey = pos.yes.filled ? 'no' : 'yes';
+                    logger.warn(`MM: one side filled after cancel — switching to adaptive CL for ${unfilledKey.toUpperCase()} instead of defensive pivot`);
+                    await adaptiveLegCL(pos, unfilledKey);
+                    break;
+                }
+
+                // If both filled (unlikely but possible), we're done
+                if (pos.yes.filled && pos.no.filled) {
+                    pos.status = 'done';
+                    const totalPnl = calcPnl(pos);
+                    logger.money(`MM: BOTH sides filled! Total P&L: $${totalPnl.toFixed(2)} | ${label}`);
+                    break;
+                }
+
+                // Neither filled — proceed with defensive pivot
                 pos._defensiveActive = true;
                 await defensivePivot(pos);
                 break;
